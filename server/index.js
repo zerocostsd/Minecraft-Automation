@@ -6,6 +6,7 @@ const express = require('express')
 const mineflayer = require('mineflayer')
 const { db, databaseName, client, ensureDatabase } = require('./database')
 const botService = require('./bot')
+const { validateFlatSurface } = require('./jobs/flat-surface')
 
 const app = express()
 const root = path.join(__dirname, '..')
@@ -29,8 +30,67 @@ function mapProfile (profile) {
     username: profile.username || '',
     authMode: profile.auth_mode || 'microsoft',
     minecraftVersion: profile.minecraft_version || '1.21.5',
+    botSettings: {
+      emergencyLeave: Boolean(profile.emergency_leave),
+      autoEat: Boolean(profile.auto_eat),
+      fightMobs: Boolean(profile.fight_mobs),
+      neverBreakTools: Boolean(profile.never_break_tools),
+      greetPlayers: Boolean(profile.greet_players)
+    },
     createdAt: profile.created_at,
     updatedAt: profile.updated_at
+  }
+}
+
+function mapJob (job) {
+  return {
+    id: job.id,
+    profileId: job.profile_id,
+    type: job.type,
+    name: job.name,
+    x1: job.x1,
+    y1: job.y1,
+    z1: job.z1,
+    x2: job.x2,
+    y2: job.y2,
+    z2: job.z2,
+    chestX: job.chest_x,
+    chestY: job.chest_y,
+    chestZ: job.chest_z,
+    status: job.status,
+    completedColumns: job.completed_columns,
+    totalColumns: job.total_columns,
+    error: job.error,
+    createdAt: job.created_at,
+    updatedAt: job.updated_at
+  }
+}
+
+function readFlatSurfaceInput (body) {
+  const keys = ['x1', 'y1', 'z1', 'x2', 'y2', 'z2', 'chestX', 'chestY', 'chestZ']
+  for (const key of keys) {
+    if (body[key] === '' || body[key] === null || body[key] === undefined) {
+      throw Object.assign(new Error(`${key} is required.`), { status: 400 })
+    }
+  }
+
+  const job = {
+    x1: Number(body.x1),
+    y1: Number(body.y1),
+    z1: Number(body.z1),
+    x2: Number(body.x2),
+    y2: Number(body.y2),
+    z2: Number(body.z2),
+    chestX: Number(body.chestX),
+    chestY: Number(body.chestY),
+    chestZ: Number(body.chestZ)
+  }
+
+  try {
+    const { totalColumns } = validateFlatSurface(job)
+    return { ...job, totalColumns }
+  } catch (error) {
+    throw Object.assign(error, { status: 400 })
   }
 }
 
@@ -40,6 +100,7 @@ function validateSettings (body) {
   const portValue = body.port === '' || body.port === null || body.port === undefined ? null : Number(body.port)
   const authMode = String(body.authMode || 'microsoft').toLowerCase()
   const minecraftVersion = String(body.minecraftVersion || '1.21.5')
+  const botSettings = body.botSettings ?? {}
 
   if (host.length > 255) throw Object.assign(new Error('Server IP must be 255 characters or less.'), { status: 400 })
   if (username.length > 80) throw Object.assign(new Error('Username must be 80 characters or less.'), { status: 400 })
@@ -52,8 +113,27 @@ function validateSettings (body) {
   if (!mineflayer.testedVersions.includes(minecraftVersion)) {
     throw Object.assign(new Error('Select a Minecraft version tested by Mineflayer.'), { status: 400 })
   }
+  if (typeof botSettings !== 'object' || Array.isArray(botSettings)) {
+    throw Object.assign(new Error('Bot settings must be an object.'), { status: 400 })
+  }
+  const readSetting = key => {
+    const value = botSettings[key] ?? false
+    if (typeof value !== 'boolean') throw Object.assign(new Error(`Bot setting '${key}' must be true or false.`), { status: 400 })
+    return value
+  }
 
-  return { host, port: portValue, username, auth_mode: authMode, minecraft_version: minecraftVersion }
+  return {
+    host,
+    port: portValue,
+    username,
+    auth_mode: authMode,
+    minecraft_version: minecraftVersion,
+    emergency_leave: readSetting('emergencyLeave'),
+    auto_eat: readSetting('autoEat'),
+    fight_mobs: readSetting('fightMobs'),
+    never_break_tools: readSetting('neverBreakTools'),
+    greet_players: readSetting('greetPlayers')
+  }
 }
 
 app.get('/api/health', asyncRoute(async (req, res) => {
@@ -75,6 +155,91 @@ app.get('/api/profiles', asyncRoute(async (req, res) => {
 app.get('/api/versions', (req, res) => {
   res.json(mineflayer.testedVersions)
 })
+
+app.get('/api/jobs', asyncRoute(async (req, res) => {
+  await ensureDatabase()
+  const profileId = Number(req.query.profileId)
+  if (!Number.isInteger(profileId)) throw Object.assign(new Error('Select a profile to load its jobs.'), { status: 400 })
+  const jobs = await db('jobs').where({ profile_id: profileId }).orderBy('created_at', 'desc')
+  res.json(jobs.map(mapJob))
+}))
+
+app.post('/api/jobs', asyncRoute(async (req, res) => {
+  await ensureDatabase()
+  const profileId = Number(req.body.profileId)
+  if (!Number.isInteger(profileId) || !(await db('profiles').where({ id: profileId }).first())) {
+    throw Object.assign(new Error('Select a valid profile for this job.'), { status: 400 })
+  }
+  const name = String(req.body.name || 'Flat Surface').trim()
+  if (!name || name.length > 80) throw Object.assign(new Error('Job name must contain 1 to 80 characters.'), { status: 400 })
+  const coordinates = readFlatSurfaceInput(req.body)
+  const record = {
+    profile_id: profileId,
+    type: 'flat_surface',
+    name,
+    x1: coordinates.x1,
+    y1: coordinates.y1,
+    z1: coordinates.z1,
+    x2: coordinates.x2,
+    y2: coordinates.y2,
+    z2: coordinates.z2,
+    chest_x: coordinates.chestX,
+    chest_y: coordinates.chestY,
+    chest_z: coordinates.chestZ,
+    total_columns: coordinates.totalColumns
+  }
+
+  let job
+  if (client === 'pg') {
+    const [created] = await db('jobs').insert(record).returning('*')
+    job = created
+  } else {
+    const [id] = await db('jobs').insert(record)
+    job = await db('jobs').where({ id }).first()
+  }
+  res.status(201).json(mapJob(job))
+}))
+
+app.delete('/api/jobs/:id', asyncRoute(async (req, res) => {
+  await ensureDatabase()
+  const id = Number(req.params.id)
+  if (botService.getState().activeJob?.id === id) {
+    throw Object.assign(new Error('Stop the running job before deleting it.'), { status: 409 })
+  }
+  const deleted = await db('jobs').where({ id }).delete()
+  if (!deleted) return res.status(404).json({ error: 'Job not found.' })
+  res.status(204).end()
+}))
+
+app.post('/api/jobs/:id/start', asyncRoute(async (req, res) => {
+  await ensureDatabase()
+  const id = Number(req.params.id)
+  const job = await db('jobs').where({ id }).first()
+  if (!job) return res.status(404).json({ error: 'Job not found.' })
+  if (job.type !== 'flat_surface') throw Object.assign(new Error('This job type is not supported.'), { status: 400 })
+  await db('jobs').where({ id }).update({ status: 'running', completed_columns: 0, error: null, updated_at: db.fn.now() })
+
+  try {
+    const activeJob = botService.startFlatSurface({ ...job, status: 'running', completed_columns: 0 }, async progress => {
+      await db('jobs').where({ id }).update({
+        status: progress.status,
+        completed_columns: progress.completedColumns,
+        error: progress.error,
+        updated_at: db.fn.now()
+      })
+    })
+    res.status(202).json(activeJob)
+  } catch (error) {
+    await db('jobs').where({ id }).update({ status: 'failed', error: error.message, updated_at: db.fn.now() })
+    throw Object.assign(error, { status: error.status || 400 })
+  }
+}))
+
+app.post('/api/jobs/:id/stop', asyncRoute(async (req, res) => {
+  const activeJob = botService.stopJob(Number(req.params.id))
+  await db('jobs').where({ id: activeJob.id }).update({ status: 'stopping', updated_at: db.fn.now() })
+  res.json(activeJob)
+}))
 
 app.post('/api/profiles', asyncRoute(async (req, res) => {
   await ensureDatabase()
@@ -108,7 +273,9 @@ app.put('/api/profiles/:id', asyncRoute(async (req, res) => {
   const updated = await db('profiles').where({ id }).update({ ...settings, updated_at: db.fn.now() })
   if (!updated) return res.status(404).json({ error: 'Profile not found.' })
   const profile = await db('profiles').where({ id }).first()
-  res.json(mapProfile(profile))
+  const mapped = mapProfile(profile)
+  if (botService.activeProfileId === id) botService.updateSettings(id, mapped.botSettings)
+  res.json(mapped)
 }))
 
 app.delete('/api/profiles/:id', asyncRoute(async (req, res) => {

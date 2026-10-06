@@ -1,9 +1,36 @@
 const path = require('node:path')
 const mineflayer = require('mineflayer')
+const { pathfinder, Movements } = require('mineflayer-pathfinder')
+const pvpPlugin = require('mineflayer-pvp').plugin
+const { runFlatSurface } = require('./jobs/flat-surface')
 
 let bot = null
 let activeProfileId = null
 let viewerStarted = false
+let protectedTool = null
+let lastGreetingAt = 0
+let activeJobController = null
+let defaultMovements = null
+let botSettings = {
+  emergencyLeave: false,
+  autoEat: false,
+  fightMobs: false,
+  neverBreakTools: false,
+  greetPlayers: false
+}
+
+const greetingCooldowns = new Map()
+const hostileMobs = new Set([
+  'blaze', 'bogged', 'cave_spider', 'drowned', 'husk', 'magma_cube',
+  'phantom', 'pillager', 'silverfish', 'skeleton', 'slime', 'spider',
+  'stray', 'vindicator', 'witch', 'zombie', 'zombie_villager'
+])
+const greetings = [
+  username => `Hello, ${username}!`,
+  username => `Hey ${username}, welcome!`,
+  username => `Hi ${username}!`,
+  username => `Good to see you, ${username}.`
+]
 
 const state = {
   connected: false,
@@ -22,7 +49,9 @@ const state = {
   inventory: [],
   armor: [],
   offhand: null,
-  mainHand: null
+  mainHand: null,
+  botSettings: { ...botSettings },
+  activeJob: null
 }
 
 function addLog (level, message) {
@@ -86,7 +115,210 @@ function refreshSnapshot () {
 
 function getState () {
   refreshSnapshot()
-  return { ...state, inventory: [...state.inventory], armor: [...state.armor], chat: [...state.chat], logs: [...state.logs] }
+  return { ...state, inventory: [...state.inventory], armor: [...state.armor], chat: [...state.chat], logs: [...state.logs], botSettings: { ...state.botSettings }, activeJob: state.activeJob ? { ...state.activeJob } : null }
+}
+
+function stopActiveJob (reason = 'Bot disconnected.') {
+  if (!activeJobController) return
+  activeJobController.abort(reason)
+  bot?.pathfinder?.setGoal(null)
+  bot?.stopDigging?.()
+  if (state.activeJob) state.activeJob = { ...state.activeJob, status: 'stopping' }
+}
+
+function startFlatSurface (job, onPersist = async () => {}) {
+  if (!bot || !state.connected) throw new Error('Connect the bot before starting a job.')
+  if (activeProfileId !== Number(job.profile_id)) throw new Error('The job must belong to the connected profile.')
+  if (activeJobController) throw new Error('Another job is already running.')
+
+  const controller = new AbortController()
+  activeJobController = controller
+  state.activeJob = {
+    id: job.id,
+    name: job.name,
+    type: job.type,
+    status: 'running',
+    completedColumns: Number(job.completed_columns) || 0,
+    totalColumns: Number(job.total_columns),
+    minedBlocks: 0,
+    error: null
+  }
+
+  const persistProgress = async progress => {
+    if (state.activeJob?.id !== job.id) return
+    state.activeJob = { ...state.activeJob, ...progress }
+    try {
+      await onPersist({
+        status: state.activeJob.status,
+        completedColumns: state.activeJob.completedColumns,
+        error: state.activeJob.error || null
+      })
+    } catch (error) {
+      addLog('error', `Could not save job progress: ${error.message}`)
+    }
+  }
+
+  const jobConfig = {
+    ...job,
+    x1: Number(job.x1),
+    y1: Number(job.y1),
+    z1: Number(job.z1),
+    x2: Number(job.x2),
+    y2: Number(job.y2),
+    z2: Number(job.z2),
+    chestX: Number(job.chest_x),
+    chestY: Number(job.chest_y),
+    chestZ: Number(job.chest_z)
+  }
+
+  void runFlatSurface({
+    bot,
+    job: jobConfig,
+    signal: controller.signal,
+    defaultMovements,
+    onProgress: persistProgress,
+    onLog: message => addLog('info', `[${job.name}] ${message}`)
+  }).then(async () => {
+    await persistProgress({ status: 'completed', completedColumns: job.total_columns })
+  }).catch(async error => {
+    const stopped = controller.signal.aborted
+    const status = stopped ? 'stopped' : 'failed'
+    addLog(stopped ? 'warn' : 'error', `[${job.name}] ${stopped ? 'Job stopped.' : error.message}`)
+    await persistProgress({ status, error: stopped ? null : error.message })
+  }).finally(() => {
+    if (activeJobController === controller) activeJobController = null
+  })
+
+  return { ...state.activeJob }
+}
+
+function stopJob (jobId) {
+  if (!state.activeJob || state.activeJob.id !== Number(jobId) || !activeJobController) {
+    throw new Error('That job is not running.')
+  }
+  stopActiveJob('Stopped from dashboard.')
+  return { ...state.activeJob }
+}
+
+function settingsFromProfile (profile) {
+  return {
+    emergencyLeave: Boolean(profile.emergency_leave),
+    autoEat: Boolean(profile.auto_eat),
+    fightMobs: Boolean(profile.fight_mobs),
+    neverBreakTools: Boolean(profile.never_break_tools),
+    greetPlayers: Boolean(profile.greet_players)
+  }
+}
+
+async function syncAutoEat (activeBot) {
+  if (!botSettings.autoEat) {
+    activeBot.autoEat?.disableAuto()
+    activeBot.autoEat?.cancelEat()
+    return
+  }
+
+  try {
+    if (!activeBot.autoEat) {
+      const { loader } = await import('mineflayer-auto-eat')
+      if (bot !== activeBot || !botSettings.autoEat) return
+      activeBot.loadPlugin(loader)
+      activeBot.autoEat.setOpts({
+        minHunger: 14,
+        minHealth: 6,
+        bannedFood: ['rotten_flesh', 'pufferfish', 'chorus_fruit', 'poisonous_potato', 'spider_eye']
+      })
+      activeBot.autoEat.on('eatStart', ({ food }) => addLog('info', `Eating ${food.name}.`))
+      activeBot.autoEat.on('eatFail', error => addLog('warn', `Auto eat failed: ${error.message}`))
+    }
+
+    if (bot === activeBot && botSettings.autoEat) activeBot.autoEat.enableAuto()
+  } catch (error) {
+    addLog('error', `Auto eat could not start: ${error.message}`)
+  }
+}
+
+function scanHostileMobs (activeBot) {
+  if (!botSettings.fightMobs || !state.connected || !activeBot.pvp || activeBot.pvp.target) return
+  const position = activeBot.entity?.position
+  if (!position) return
+
+  const target = Object.values(activeBot.entities || {})
+    .filter(entity => entity.type === 'mob' && hostileMobs.has(entity.name) && entity.position)
+    .map(entity => ({ entity, distance: position.distanceTo(entity.position) }))
+    .filter(candidate => candidate.distance <= 8)
+    .sort((first, second) => first.distance - second.distance)[0]?.entity
+
+  if (!target) return
+  activeBot.pvp.attack(target)
+  addLog('info', `Defending against ${target.name}.`)
+}
+
+function greetNearbyPlayers (activeBot) {
+  if (!botSettings.greetPlayers || !activeBot.entity?.position) return
+  const now = Date.now()
+  if (now - lastGreetingAt < 2000) return
+
+  for (const player of Object.values(activeBot.players || {})) {
+    if (!player.entity || player.username === activeBot.username) continue
+    if (activeBot.entity.position.distanceTo(player.entity.position) > 5) continue
+
+    const key = `${activeProfileId}:${player.uuid || player.entity.uuid || player.username}`
+    const lastGreeted = greetingCooldowns.get(key) || 0
+    if (now - lastGreeted < 10 * 60 * 1000) continue
+
+    const greeting = greetings[Math.floor(Math.random() * greetings.length)](player.username)
+    greetingCooldowns.set(key, now)
+    lastGreetingAt = now
+    activeBot.chat(greeting)
+    addLog('info', `Greeted nearby player ${player.username}.`)
+    break
+  }
+}
+
+function protectHeldTool (activeBot) {
+  if (!botSettings.neverBreakTools) {
+    protectedTool = null
+    return
+  }
+
+  const item = activeBot.heldItem
+  if (item !== protectedTool) protectedTool = null
+  if (!item?.maxDurability || protectedTool === item) return
+
+  const remaining = item.maxDurability - (item.durabilityUsed || 0)
+  const threshold = Math.max(1, Math.ceil(item.maxDurability * 0.1))
+  if (remaining > threshold) return
+
+  protectedTool = item
+  activeBot.deactivateItem()
+  activeBot.stopDigging()
+  activeBot.pvp?.forceStop()
+  addLog('warn', `${item.displayName || item.name} reached its durability limit; switched away to prevent breaking.`)
+
+  const currentSlot = activeBot.quickBarSlot + 36
+  const safeSlot = activeBot.inventory.slots.findIndex((candidate, slot) => {
+    if (slot < 36 || slot > 44 || slot === currentSlot) return false
+    if (!candidate?.maxDurability) return true
+    const candidateRemaining = candidate.maxDurability - (candidate.durabilityUsed || 0)
+    return candidateRemaining > Math.max(1, Math.ceil(candidate.maxDurability * 0.1))
+  })
+
+  if (safeSlot >= 0) {
+    activeBot.setQuickBarSlot(safeSlot - 36)
+  } else {
+    activeBot.unequip('hand').catch(error => addLog('error', `Could not stow the nearly broken item: ${error.message}`))
+  }
+}
+
+function updateSettings (profileId, nextSettings) {
+  if (activeProfileId !== Number(profileId)) return
+  botSettings = { ...nextSettings }
+  state.botSettings = { ...botSettings }
+  if (!bot || !state.connected) return
+
+  void syncAutoEat(bot)
+  if (botSettings.fightMobs) scanHostileMobs(bot)
+  else bot.pvp?.forceStop()
 }
 
 function connect (profile) {
@@ -98,6 +330,10 @@ function connect (profile) {
   state.profileId = profile.id
   state.profileName = profile.name
   state.authCode = null
+  botSettings = settingsFromProfile(profile)
+  state.botSettings = { ...botSettings }
+  protectedTool = null
+  lastGreetingAt = 0
   activeProfileId = profile.id
   addLog('info', `Connecting profile "${profile.name}" to ${profile.host}:${profile.port || 25565}`)
 
@@ -118,6 +354,9 @@ function connect (profile) {
         addLog('info', 'Microsoft sign-in requires device authorization.')
       }
     })
+    bot.loadPlugin(pathfinder)
+    bot.loadPlugin(pvpPlugin)
+    defaultMovements = null
   } catch (error) {
     bot = null
     state.connecting = false
@@ -134,6 +373,17 @@ function connect (profile) {
     state.connecting = false
     state.connected = true
     addLog('info', 'Bot spawned in the world.')
+
+    const movements = new Movements(activeBot)
+    movements.canDig = false
+    defaultMovements = movements
+    activeBot.pathfinder.setMovements(movements)
+    activeBot.pvp.movements = movements
+    activeBot.pvp.followRange = 8
+    activeBot.pvp.viewDistance = 10
+    activeBot.pvp.attackRange = 3
+    void syncAutoEat(activeBot)
+    scanHostileMobs(activeBot)
 
     if (!viewerStarted) {
       try {
@@ -154,10 +404,28 @@ function connect (profile) {
     state.chat.push({ time: new Date().toISOString(), message, position: String(position || 'chat') })
     state.chat = state.chat.slice(-200)
   })
+  activeBot.on('health', () => {
+    if (bot !== activeBot || !state.connected) return
+    refreshSnapshot()
+    if (botSettings.emergencyLeave && activeBot.health < 4) {
+      disconnect(`Emergency leave triggered at ${activeBot.health}/20 health.`)
+    }
+  })
+  activeBot.on('physicsTick', () => {
+    if (bot !== activeBot || !state.connected) return
+    if (botSettings.emergencyLeave && activeBot.health < 4) {
+      disconnect(`Emergency leave triggered at ${activeBot.health}/20 health.`)
+      return
+    }
+    protectHeldTool(activeBot)
+    greetNearbyPlayers(activeBot)
+    scanHostileMobs(activeBot)
+  })
   activeBot.on('kicked', reason => addLog('warn', `Kicked: ${reason?.toString?.() || String(reason)}`))
   activeBot.on('error', error => addLog('error', error.message))
   activeBot.on('end', reason => {
     if (bot !== activeBot) return
+    stopActiveJob('Bot disconnected.')
     addLog('warn', `Disconnected${reason ? `: ${reason}` : '.'}`)
     bot = null
     activeProfileId = null
@@ -178,7 +446,8 @@ function connect (profile) {
   })
 }
 
-function disconnect () {
+function disconnect (reason = 'Disconnected from dashboard.') {
+  stopActiveJob(reason)
   if (!bot) {
     state.connecting = false
     state.connected = false
@@ -201,8 +470,8 @@ function disconnect () {
   state.armor = []
   state.offhand = null
   state.mainHand = null
-  addLog('info', 'Disconnect requested from dashboard.')
-  currentBot.end('Disconnected from dashboard')
+  addLog(reason.startsWith('Emergency leave') ? 'warn' : 'info', reason)
+  currentBot.end(reason)
 }
 
 function sendChat (message) {
@@ -250,4 +519,4 @@ function clearChat () {
   state.chat = []
 }
 
-module.exports = { getState, connect, disconnect, sendChat, inventoryAction, clearTransientData, clearChat, get activeProfileId () { return activeProfileId } }
+module.exports = { getState, connect, disconnect, sendChat, inventoryAction, clearTransientData, clearChat, updateSettings, startFlatSurface, stopJob, get activeProfileId () { return activeProfileId } }

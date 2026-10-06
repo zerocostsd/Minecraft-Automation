@@ -18,18 +18,48 @@ import {
   Menu,
   MessageSquareText,
   Package,
+  Play,
   Plus,
   Save,
   Send,
   Settings2,
   Shield,
+  Square,
   Trash2,
   Wifi,
   X,
   Zap
 } from 'lucide-react'
 
-type View = 'settings' | 'chat' | 'information'
+type View = 'settings' | 'bot-settings' | 'chat' | 'information' | 'flat-surface'
+type BotSettings = {
+  emergencyLeave: boolean
+  autoEat: boolean
+  fightMobs: boolean
+  neverBreakTools: boolean
+  greetPlayers: boolean
+}
+type FlatSurfaceJob = {
+  id: number
+  profileId: number
+  type: 'flat_surface'
+  name: string
+  x1: number
+  y1: number
+  z1: number
+  x2: number
+  y2: number
+  z2: number
+  chestX: number
+  chestY: number
+  chestZ: number
+  status: 'idle' | 'running' | 'stopping' | 'stopped' | 'completed' | 'failed'
+  completedColumns: number
+  totalColumns: number
+  error: string | null
+}
+type ActiveJob = Pick<FlatSurfaceJob, 'id' | 'name' | 'status' | 'completedColumns' | 'totalColumns' | 'error'> & { minedBlocks?: number }
+type FlatSurfaceDraft = Record<'name' | 'x1' | 'y1' | 'z1' | 'x2' | 'y2' | 'z2' | 'chestX' | 'chestY' | 'chestZ', string>
 type Profile = {
   id: number
   name: string
@@ -38,6 +68,7 @@ type Profile = {
   username: string
   authMode: 'microsoft' | 'offline'
   minecraftVersion: string
+  botSettings: BotSettings
 }
 type Item = {
   slot: number
@@ -66,14 +97,16 @@ type BotState = {
   armor: { slot: number; label: string; item: Item | null }[]
   offhand: Item | null
   mainHand: Item | null
+  activeJob: ActiveJob | null
 }
-type Draft = Pick<Profile, 'host' | 'port' | 'username' | 'authMode' | 'minecraftVersion'>
+type Draft = Pick<Profile, 'host' | 'port' | 'username' | 'authMode' | 'minecraftVersion' | 'botSettings'>
 type IconRecord = { category_slug: string; subcategory_slug?: string | null; file_slug: string }
 type Confirmation = {
-  action: 'delete-profile' | 'clear-temporary-data'
+  action: 'delete-profile' | 'clear-temporary-data' | 'start-job' | 'delete-job'
   title: string
   description: string
   confirmLabel: string
+  jobId?: number
 }
 type ToastMessage = { message: string; tone: 'success' | 'error' }
 
@@ -94,13 +127,48 @@ const emptyBot: BotState = {
   inventory: [],
   armor: [],
   offhand: null,
-  mainHand: null
+  mainHand: null,
+  activeJob: null
+}
+
+const emptyFlatSurfaceDraft: FlatSurfaceDraft = {
+  name: '',
+  x1: '',
+  y1: '',
+  z1: '',
+  x2: '',
+  y2: '',
+  z2: '',
+  chestX: '',
+  chestY: '',
+  chestZ: ''
 }
 
 const navigation: { id: View; label: string; icon: typeof Settings2 }[] = [
   { id: 'settings', label: 'Settings', icon: Settings2 },
+  { id: 'bot-settings', label: 'Bot Settings', icon: Shield },
   { id: 'chat', label: 'Live Chat & Logs', icon: MessageSquareText },
   { id: 'information', label: 'Live Information', icon: Activity }
+]
+
+const jobNavigation: { id: View; label: string; icon: typeof Settings2 }[] = [
+  { id: 'flat-surface', label: 'Flat Surface', icon: Activity }
+]
+
+const defaultBotSettings: BotSettings = {
+  emergencyLeave: false,
+  autoEat: false,
+  fightMobs: false,
+  neverBreakTools: false,
+  greetPlayers: false
+}
+
+const botSettingRows: { key: keyof BotSettings; title: string; detail: string; icon: typeof Shield }[] = [
+  { key: 'emergencyLeave', title: 'Emergency leave', detail: 'Disconnect from the server when health falls below 4/20. The bot will not reconnect automatically.', icon: Heart },
+  { key: 'autoEat', title: 'Auto eat to stay alive', detail: 'Eat available food automatically when hunger reaches 14/20 or lower.', icon: Zap },
+  { key: 'fightMobs', title: 'Fight hostile mobs', detail: 'Defend against nearby zombies, skeletons, spiders, and other supported hostiles. Players, passive mobs, creepers, endermen, and wardens are ignored.', icon: Shield },
+  { key: 'neverBreakTools', title: 'Never break tools', detail: 'Stop using and stow a held durable item when 10% durability or less remains.', icon: Settings2 },
+  { key: 'greetPlayers', title: 'Greet nearby players', detail: 'Send a random greeting when a player comes within 5 blocks. Each player has a 10-minute cooldown.', icon: MessageSquareText }
 ]
 
 async function api<T> (url: string, init?: RequestInit): Promise<T> {
@@ -137,7 +205,7 @@ function App () {
   const [profiles, setProfiles] = useState<Profile[]>([])
   const [supportedVersions, setSupportedVersions] = useState<string[]>([])
   const [activeProfileId, setActiveProfileId] = useState<number | null>(null)
-  const [draft, setDraft] = useState<Draft>({ host: '', port: null, username: '', authMode: 'microsoft', minecraftVersion: '1.21.5' })
+  const [draft, setDraft] = useState<Draft>({ host: '', port: null, username: '', authMode: 'microsoft', minecraftVersion: '1.21.5', botSettings: { ...defaultBotSettings } })
   const [bot, setBot] = useState<BotState>(emptyBot)
   const [view, setView] = useState<View>('settings')
   const [drawerOpen, setDrawerOpen] = useState(false)
@@ -150,16 +218,21 @@ function App () {
   const [confirmation, setConfirmation] = useState<Confirmation | null>(null)
   const [busy, setBusy] = useState(false)
   const [iconRecords, setIconRecords] = useState<Record<string, IconRecord>>({})
+  const [jobs, setJobs] = useState<FlatSurfaceJob[]>([])
+  const [jobDraft, setJobDraft] = useState<FlatSurfaceDraft>({ ...emptyFlatSurfaceDraft })
+  const [jobsBusy, setJobsBusy] = useState(false)
+  const [jobsError, setJobsError] = useState('')
   const chatEnd = useRef<HTMLDivElement>(null)
 
   const activeProfile = profiles.find(profile => profile.id === activeProfileId) || null
-  const activeView = navigation.find(item => item.id === view)!
+  const activeView = [...navigation, ...jobNavigation].find(item => item.id === view)!
   const isDirty = Boolean(activeProfile && (
     draft.host !== activeProfile.host ||
     draft.port !== activeProfile.port ||
     draft.username !== activeProfile.username ||
     draft.authMode !== activeProfile.authMode ||
-    draft.minecraftVersion !== activeProfile.minecraftVersion
+    draft.minecraftVersion !== activeProfile.minecraftVersion ||
+    Object.keys(defaultBotSettings).some(key => draft.botSettings[key as keyof BotSettings] !== activeProfile.botSettings[key as keyof BotSettings])
   ))
 
   function notify (message: string, tone: ToastMessage['tone'] = 'success') {
@@ -193,9 +266,25 @@ function App () {
 
   async function refreshBot () {
     try {
-      setBot(await api<BotState>('/api/bot/state'))
+      const nextBot = await api<BotState>('/api/bot/state')
+      setBot(nextBot)
+      if (nextBot.activeJob) {
+        setJobs(current => current.map(job => job.id === nextBot.activeJob?.id
+          ? { ...job, status: nextBot.activeJob.status, completedColumns: nextBot.activeJob.completedColumns, error: nextBot.activeJob.error }
+          : job))
+      }
     } catch {
       setBot(emptyBot)
+    }
+  }
+
+  async function loadJobs () {
+    if (!activeProfileId) return
+    setJobsError('')
+    try {
+      setJobs(await api<FlatSurfaceJob[]>(`/api/jobs?profileId=${activeProfileId}`))
+    } catch (error) {
+      setJobsError(error instanceof Error ? error.message : 'Jobs could not be loaded.')
     }
   }
 
@@ -226,9 +315,13 @@ function App () {
 
   useEffect(() => {
     setDraft(activeProfile
-      ? { host: activeProfile.host, port: activeProfile.port, username: activeProfile.username, authMode: activeProfile.authMode, minecraftVersion: activeProfile.minecraftVersion }
-      : { host: '', port: null, username: '', authMode: 'microsoft', minecraftVersion: '1.21.5' })
+      ? { host: activeProfile.host, port: activeProfile.port, username: activeProfile.username, authMode: activeProfile.authMode, minecraftVersion: activeProfile.minecraftVersion, botSettings: { ...activeProfile.botSettings } }
+      : { host: '', port: null, username: '', authMode: 'microsoft', minecraftVersion: '1.21.5', botSettings: { ...defaultBotSettings } })
   }, [activeProfile?.id])
+
+  useEffect(() => {
+    if (view === 'flat-surface' && database === 'connected') void loadJobs()
+  }, [view, database, activeProfileId])
 
   useEffect(() => {
     chatEnd.current?.scrollIntoView({ block: 'end', behavior: 'smooth' })
@@ -260,6 +353,80 @@ function App () {
     setActiveProfileId(id)
     window.localStorage.setItem('active-profile-id', String(id))
     setView('settings')
+  }
+
+  function setJobField (key: keyof FlatSurfaceDraft, value: string) {
+    setJobDraft(current => ({ ...current, [key]: value }))
+  }
+
+  async function createFlatSurfaceJob (event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    if (!activeProfile) return
+    setJobsBusy(true)
+    setJobsError('')
+    try {
+      const created = await api<FlatSurfaceJob>('/api/jobs', {
+        method: 'POST',
+        body: JSON.stringify({ ...jobDraft, profileId: activeProfile.id })
+      })
+      setJobs(current => [created, ...current])
+      setJobDraft({ ...emptyFlatSurfaceDraft })
+      notify('Flat Surface job saved.')
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Job could not be saved.'
+      setJobsError(message)
+      notify(message, 'error')
+    } finally {
+      setJobsBusy(false)
+    }
+  }
+
+  function requestStartJob (job: FlatSurfaceJob) {
+    setConfirmation({
+      action: 'start-job',
+      jobId: job.id,
+      title: `Start ${job.name}?`,
+      description: `This will dig ${job.x2 - job.x1 + 1} by ${job.z2 - job.z1 + 1} columns from Y ${job.y1} through ${job.y2}. The bot may break path obstructions and place bridge blocks. Make sure the output chest is reachable and the bot carries bridge blocks.`,
+      confirmLabel: 'Start job'
+    })
+  }
+
+  async function startJob (jobId: number) {
+    setJobsBusy(true)
+    try {
+      await api(`/api/jobs/${jobId}/start`, { method: 'POST' })
+      setJobs(current => current.map(job => job.id === jobId ? { ...job, status: 'running', completedColumns: 0, error: null } : job))
+      await refreshBot()
+      notify('Flat Surface job started.')
+    } catch (error) {
+      notify(error instanceof Error ? error.message : 'Job could not be started.', 'error')
+      await loadJobs()
+    } finally {
+      setJobsBusy(false)
+    }
+  }
+
+  async function stopJob (jobId: number) {
+    setJobsBusy(true)
+    try {
+      await api(`/api/jobs/${jobId}/stop`, { method: 'POST' })
+      setJobs(current => current.map(job => job.id === jobId ? { ...job, status: 'stopping' } : job))
+      notify('Stop requested.')
+    } catch (error) {
+      notify(error instanceof Error ? error.message : 'Job could not be stopped.', 'error')
+    } finally {
+      setJobsBusy(false)
+    }
+  }
+
+  async function deleteJob (jobId: number) {
+    try {
+      await api(`/api/jobs/${jobId}`, { method: 'DELETE' })
+      setJobs(current => current.filter(job => job.id !== jobId))
+      notify('Job deleted.')
+    } catch (error) {
+      notify(error instanceof Error ? error.message : 'Job could not be deleted.', 'error')
+    }
   }
 
   async function createProfile (event: FormEvent<HTMLFormElement>) {
@@ -332,9 +499,12 @@ function App () {
 
   async function confirmDestructiveAction () {
     if (!confirmation) return
-    if (confirmation.action === 'delete-profile') await deleteProfile()
-    else await clearTemporaryData()
+    const pending = confirmation
     setConfirmation(null)
+    if (pending.action === 'delete-profile') await deleteProfile()
+    else if (pending.action === 'clear-temporary-data') await clearTemporaryData()
+    else if (pending.action === 'start-job' && pending.jobId) await startJob(pending.jobId)
+    else if (pending.action === 'delete-job' && pending.jobId) await deleteJob(pending.jobId)
   }
 
   async function clearChat () {
@@ -404,6 +574,10 @@ function App () {
     setDraft(current => ({ ...current, [key]: value }))
   }
 
+  function setBotSetting (key: keyof BotSettings, value: boolean) {
+    setDraft(current => ({ ...current, botSettings: { ...current.botSettings, [key]: value } }))
+  }
+
   if (database === 'loading') {
     return <div className="system-screen"><div className="system-mark"><BrandLogo compact /></div><div className="loader-line" /><p>Checking database connection</p></div>
   }
@@ -451,6 +625,13 @@ function App () {
           <Icon size={17} strokeWidth={1.7} /><span>{item.label}</span>{view === item.id && <span className="nav-active-mark" />}
         </button>
       })}</nav>
+      <div className="drawer-section-label jobs-nav-heading">JOBS</div>
+      <nav className="jobs-navigation">{jobNavigation.map(item => {
+        const Icon = item.icon
+        return <button key={item.id} className={`drawer-link ${view === item.id ? 'active' : ''}`} onClick={() => { setView(item.id); setDrawerOpen(false) }}>
+          <Icon size={17} strokeWidth={1.7} /><span>{item.label}</span>{view === item.id && <span className="nav-active-mark" />}
+        </button>
+      })}</nav>
       <div className="drawer-profile"><span className="drawer-section-label">ACTIVE PROFILE</span><strong>{activeProfile?.name}</strong><span>{activeProfile?.host || 'Server not configured'}</span><button onClick={() => { setView('settings'); setDrawerOpen(false) }}><Settings2 size={13} /> Profile settings</button></div>
       <div className="drawer-footer"><span><i className="status-dot" /> STORAGE ONLINE</span><span>BUILD 0.1.0 / MC {activeProfile.minecraftVersion}</span></div>
     </aside>
@@ -472,7 +653,7 @@ function App () {
     {bot.authCode && <div className="auth-banner"><span><Shield size={16} /> Microsoft sign-in required</span><strong>{bot.authCode.userCode}</strong><a href={bot.authCode.verificationUri} target="_blank" rel="noreferrer">Open sign-in <ArrowUpRight size={13} /></a></div>}
 
     <main className="main-content">
-      <div className="page-heading"><div><span className="eyebrow">{activeProfile.name.toUpperCase()} / {view === 'settings' ? 'CONFIGURATION' : view === 'chat' ? 'COMMUNICATION' : 'TELEMETRY'}</span><h1>{activeView.label}</h1></div><div className="heading-meta"><span className={`connection-copy ${bot.connected ? 'is-live' : ''}`}><i className={`status-dot ${bot.connected ? 'status-dot-live' : bot.connecting ? 'status-dot-wait' : ''}`} />{bot.connected ? 'CONNECTED' : bot.connecting ? 'CONNECTING' : 'DISCONNECTED'}</span><span className="meta-separator" /> <span>PROFILE {String(activeProfile.id).padStart(2, '0')}</span></div></div>
+      <div className="page-heading"><div><span className="eyebrow">{activeProfile.name.toUpperCase()} / {view === 'settings' ? 'CONFIGURATION' : view === 'bot-settings' ? 'BOT BEHAVIOR' : view === 'flat-surface' ? 'JOBS' : view === 'chat' ? 'COMMUNICATION' : 'TELEMETRY'}</span><h1>{activeView.label}</h1></div><div className="heading-meta"><span className={`connection-copy ${bot.connected ? 'is-live' : ''}`}><i className={`status-dot ${bot.connected ? 'status-dot-live' : bot.connecting ? 'status-dot-wait' : ''}`} />{bot.connected ? 'CONNECTED' : bot.connecting ? 'CONNECTING' : 'DISCONNECTED'}</span><span className="meta-separator" /> <span>PROFILE {String(activeProfile.id).padStart(2, '0')}</span></div></div>
 
       {view === 'settings' && <section className="settings-layout">
         <div className="settings-main">
@@ -500,6 +681,62 @@ function App () {
           </section>
         </div>
         <aside className="settings-aside"><div className="aside-kicker"><span>PROFILE</span><span>{String(activeProfile.id).padStart(2, '0')}</span></div><div className="profile-monogram">{activeProfile.name.slice(0, 1).toUpperCase()}</div><h2>{activeProfile.name}</h2><p>{draft.host || 'No server configured'}</p><div className="aside-rule" /><div className="aside-stat"><span>GAME VERSION</span><strong>{draft.minecraftVersion}</strong></div><div className="aside-stat"><span>DATABASE</span><strong>{databaseEngine}</strong></div><div className="aside-stat"><span>AUTH MODE</span><strong>{draft.authMode === 'microsoft' ? 'MICROSOFT' : 'OFFLINE'}</strong></div><div className="aside-footer"><Command size={13} /> PROFILE DATA SAVES INDEPENDENTLY</div></aside>
+      </section>}
+
+      {view === 'bot-settings' && <section className="bot-settings-layout">
+        <div className="bot-settings-intro"><div className="section-header"><span className="section-index">AUTO</span><div><h2>Behavior controls</h2><p>These actions run only while this profile is connected. All are disabled by default.</p></div></div><span className="settings-save-state">{isDirty ? 'UNSAVED CHANGES' : 'SAVED TO PROFILE'}</span></div>
+        <div className="bot-settings-list">{botSettingRows.map(setting => {
+          const Icon = setting.icon
+          const checked = draft.botSettings[setting.key]
+          return <article className={`bot-setting-row ${checked ? 'is-enabled' : ''}`} key={setting.key}>
+            <div className="bot-setting-icon"><Icon size={17} strokeWidth={1.7} /></div>
+            <div className="bot-setting-copy"><h3>{setting.title}</h3><p>{setting.detail}</p></div>
+            <button type="button" className={`toggle-switch ${checked ? 'is-on' : ''}`} role="switch" aria-checked={checked} aria-label={setting.title} onClick={() => setBotSetting(setting.key, !checked)}><span /></button>
+          </article>
+        })}</div>
+        <div className="bot-settings-footer"><span><CircleHelp size={14} /> Changes are stored with this profile. Use Save Profile in the top bar to apply them.</span><span>{Object.values(draft.botSettings).filter(Boolean).length} / {botSettingRows.length} ENABLED</span></div>
+      </section>}
+
+      {view === 'flat-surface' && <section className="flat-jobs-layout">
+        <div className="flat-job-intro"><div><span className="eyebrow">JOB TYPE / TERRAIN</span><h2>Flatten a surface</h2><p>Dig a bounded volume in a continuous Z-snake. The bot keeps the floor at Y1 - 1 and clears each column from top to bottom. Maximum area: 65,536 columns.</p></div><span className="job-depth-chip">MAX DEPTH <strong>4 BLOCKS</strong></span></div>
+
+        <form className="flat-job-form" onSubmit={event => void createFlatSurfaceJob(event)}>
+          <div className="flat-job-form-heading"><SectionHeader index="01" title="Job area" subtitle="X1 and Z1 must be the lower horizontal corner; Y1 is the lower vertical level." /><span className="job-version-label">FLAT SURFACE</span></div>
+          <Field label="Job name"><input maxLength={80} placeholder="North clearing" value={jobDraft.name} onChange={event => setJobField('name', event.target.value)} /></Field>
+
+          <div className="job-coordinate-pair">
+            <CoordinateGroup title="Start corner" corner="X1 / Y1 / Z1" values={jobDraft} keys={['x1', 'y1', 'z1']} onChange={setJobField} />
+            <CoordinateGroup title="End corner" corner="X2 / Y2 / Z2" values={jobDraft} keys={['x2', 'y2', 'z2']} onChange={setJobField} />
+          </div>
+
+          <div className="job-height-note"><span>INCLUSIVE DIGGING HEIGHT</span><strong>{jobDraft.y1 !== '' && jobDraft.y2 !== '' && Number(jobDraft.y2) >= Number(jobDraft.y1) ? `${Number(jobDraft.y2) - Number(jobDraft.y1) + 1} / 4 blocks` : '-- / 4 blocks'}</strong><small>For example, Y1 = 1 and Y2 = 4 clears four layers.</small></div>
+
+          <div className="job-form-divider" />
+          <SectionHeader index="02" title="Output chest" subtitle="Place a chest outside the dig volume and make sure it is reachable." />
+          <CoordinateGroup title="Chest block coordinates" corner="X / Y / Z" values={jobDraft} keys={['chestX', 'chestY', 'chestZ']} onChange={setJobField} />
+
+          <div className="job-safety-note"><Shield size={15} /><span>Bring at least 16 dirt, stone, or cobblestone blocks for safe bridging. The route starts at X1 - 1, Y1, Z1 and checks the floor at Y1 - 1 before each step. Water and lava inside the digging volume are left untouched.</span></div>
+          {!bot.connected && <div className="job-disconnected-note"><Wifi size={14} /> Connect the bot to start a saved job.</div>}
+          {jobsError && <div className="job-form-error"><CircleAlert size={14} />{jobsError}</div>}
+          <div className="job-form-actions"><span>Jobs are saved to profile <strong>{activeProfile.name}</strong>.</span><button type="submit" className="button button-primary" disabled={jobsBusy}><Plus size={15} /> Save job</button></div>
+        </form>
+
+        <section className="saved-jobs-section">
+          <div className="saved-jobs-heading"><SectionHeader index="03" title="Saved jobs" subtitle="One job runs at a time. Start requires a connected bot." /><span>{String(jobs.length).padStart(2, '0')} JOBS</span></div>
+          {jobsError && !jobs.length && <div className="jobs-empty"><CircleAlert size={17} /><strong>Jobs could not be loaded</strong><span>{jobsError}</span></div>}
+          {!jobs.length && !jobsError && <div className="jobs-empty"><Activity size={17} /><strong>No saved jobs</strong><span>Define an area and output chest above, then save it here.</span></div>}
+          <div className="saved-jobs-list">{jobs.map(job => {
+            const isRunning = job.status === 'running' || job.status === 'stopping'
+            const progress = job.totalColumns ? Math.min(100, job.completedColumns / job.totalColumns * 100) : 0
+            return <article className="saved-job-card" key={job.id}>
+              <div className="saved-job-main"><div className="saved-job-mark"><Activity size={16} /></div><div className="saved-job-details"><div className="saved-job-title"><h3>{job.name}</h3><span className={`job-status status-${job.status}`}>{job.status}</span></div><p>X {job.x1} to {job.x2} / Y {job.y1} to {job.y2} / Z {job.z1} to {job.z2}</p><small>CHEST {job.chestX}, {job.chestY}, {job.chestZ} | {job.totalColumns.toLocaleString()} COLUMNS</small>{(isRunning || job.completedColumns > 0) && <div className="job-progress"><span style={{ width: `${progress}%` }} /></div>}{job.error && <span className="saved-job-error">{job.error}</span>}</div></div>
+              <div className="saved-job-actions">
+                {isRunning ? <button className="icon-button job-stop-button" title="Stop job" onClick={() => void stopJob(job.id)} disabled={jobsBusy}><Square size={15} /></button> : <button className="icon-button job-start-button" title="Start job" onClick={() => requestStartJob(job)} disabled={!bot.connected || jobsBusy}><Play size={15} /></button>}
+                <button className="icon-button job-delete-button" title="Delete saved job" onClick={() => setConfirmation({ action: 'delete-job', jobId: job.id, title: `Delete ${job.name}?`, description: 'This removes the saved job and its progress record.', confirmLabel: 'Delete job' })} disabled={isRunning || jobsBusy}><Trash2 size={15} /></button>
+              </div>
+            </article>
+          })}</div>
+        </section>
       </section>}
 
       {view === 'chat' && <section className="console-grid">
@@ -581,6 +818,19 @@ function SectionHeader ({ index, title, subtitle }: { index: string; title: stri
   return <div className="section-header"><span className="section-index">{index}</span><div><h2>{title}</h2><p>{subtitle}</p></div></div>
 }
 
+function CoordinateGroup ({ title, corner, values, keys, onChange }: {
+  title: string
+  corner: string
+  values: FlatSurfaceDraft
+  keys: (keyof FlatSurfaceDraft)[]
+  onChange: (key: keyof FlatSurfaceDraft, value: string) => void
+}) {
+  return <div className="coordinate-group">
+    <div className="coordinate-group-heading"><strong>{title}</strong><span>{corner}</span></div>
+    <div className="coordinate-input-grid">{keys.map(key => <Field key={key} label={key.toUpperCase()}><input type="number" step="1" placeholder="0" value={values[key]} onChange={event => onChange(key, event.target.value)} required /></Field>)}</div>
+  </div>
+}
+
 function Field ({ label, hint, className = '', children }: { label: string; hint?: string; className?: string; children: ReactNode }) {
   return <label className={`field ${className}`}><span>{label}{hint && <small>{hint}</small>}</span>{children}</label>
 }
@@ -639,13 +889,14 @@ function ProfileDialog ({ name, setName, onSubmit, onClose, busy }: { name: stri
 }
 
 function ConfirmationDialog ({ confirmation, busy, onCancel, onConfirm }: { confirmation: Confirmation; busy: boolean; onCancel: () => void; onConfirm: () => void }) {
+  const ActionIcon = confirmation.action === 'start-job' ? Play : Trash2
   return <div className="modal-scrim" onMouseDown={event => { if (event.target === event.currentTarget) onCancel() }} onKeyDown={event => { if (event.key === 'Escape') onCancel() }}>
     <section className="confirmation-modal" role="alertdialog" aria-modal="true" aria-labelledby="confirmation-title" aria-describedby="confirmation-description">
       <div className="confirmation-icon"><CircleAlert size={19} /></div>
       <span className="eyebrow">CONFIRM ACTION</span>
       <h2 id="confirmation-title">{confirmation.title}</h2>
       <p id="confirmation-description">{confirmation.description}</p>
-      <div className="modal-actions"><button type="button" className="button button-secondary" onClick={onCancel} disabled={busy}>Cancel</button><button type="button" className="button button-danger" onClick={onConfirm} disabled={busy} autoFocus><Trash2 size={14} />{busy ? 'Working...' : confirmation.confirmLabel}</button></div>
+      <div className="modal-actions"><button type="button" className="button button-secondary" onClick={onCancel} disabled={busy}>Cancel</button><button type="button" className="button button-danger" onClick={onConfirm} disabled={busy} autoFocus><ActionIcon size={14} />{busy ? 'Working...' : confirmation.confirmLabel}</button></div>
     </section>
   </div>
 }
