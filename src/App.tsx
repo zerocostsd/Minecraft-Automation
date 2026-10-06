@@ -12,6 +12,7 @@ import {
   CircleHelp,
   Command,
   Database,
+  Eye,
   FileText,
   Gem,
   Heart,
@@ -31,7 +32,7 @@ import {
   Zap
 } from 'lucide-react'
 
-type View = 'settings' | 'bot-settings' | 'chat' | 'information' | 'flat-surface'
+type View = 'settings' | 'bot-settings' | 'chat' | 'information' | 'flat-surface' | 'viewer'
 type BotSettings = {
   emergencyLeave: boolean
   autoEat: boolean
@@ -98,6 +99,9 @@ type BotState = {
   offhand: Item | null
   mainHand: Item | null
   activeJob: ActiveJob | null
+  viewerEnabled: boolean
+  viewerRunning: boolean
+  viewerPort: number
 }
 type Draft = Pick<Profile, 'host' | 'port' | 'username' | 'authMode' | 'minecraftVersion' | 'botSettings'>
 type IconRecord = { category_slug: string; subcategory_slug?: string | null; file_slug: string }
@@ -128,7 +132,10 @@ const emptyBot: BotState = {
   armor: [],
   offhand: null,
   mainHand: null,
-  activeJob: null
+  activeJob: null,
+  viewerEnabled: false,
+  viewerRunning: false,
+  viewerPort: 3001
 }
 
 const emptyFlatSurfaceDraft: FlatSurfaceDraft = {
@@ -148,7 +155,8 @@ const navigation: { id: View; label: string; icon: typeof Settings2 }[] = [
   { id: 'settings', label: 'Settings', icon: Settings2 },
   { id: 'bot-settings', label: 'Bot Settings', icon: Shield },
   { id: 'chat', label: 'Live Chat & Logs', icon: MessageSquareText },
-  { id: 'information', label: 'Live Information', icon: Activity }
+  { id: 'information', label: 'Live Information', icon: Activity },
+  { id: 'viewer', label: 'Live 3D View', icon: Eye }
 ]
 
 const jobNavigation: { id: View; label: string; icon: typeof Settings2 }[] = [
@@ -275,6 +283,21 @@ function App () {
       }
     } catch {
       setBot(emptyBot)
+    }
+  }
+
+  async function toggleViewer () {
+    const enabled = !bot.viewerEnabled
+    try {
+      const status = await api<{ enabled: boolean; running: boolean; port: number }>('/api/viewer', {
+        method: 'POST',
+        body: JSON.stringify({ enabled })
+      })
+      setBot(current => ({ ...current, viewerEnabled: status.enabled, viewerRunning: status.running, viewerPort: status.port }))
+      notify(enabled ? '3D preview enabled.' : '3D preview disabled.')
+    } catch (error) {
+      notify(error instanceof Error ? error.message : '3D preview setting could not be changed.', 'error')
+      await refreshBot()
     }
   }
 
@@ -643,6 +666,7 @@ function App () {
         <label className="profile-select-wrap"><span className="sr-only">Active profile</span><select value={activeProfileId ?? ''} disabled={bot.connected || bot.connecting} onChange={event => selectProfile(Number(event.target.value))} aria-label="Select profile">{profiles.map(profile => <option key={profile.id} value={profile.id}>{profile.name}</option>)}</select><ChevronDown size={13} /></label>
         <button className="icon-button top-action" title="Create new profile" onClick={() => setProfileDialogOpen(true)} disabled={bot.connected || bot.connecting}><Plus size={17} /></button>
         <button className="icon-button top-action save-action" title="Save profile" onClick={() => void saveProfile()} disabled={!isDirty || busy}><Save size={16} /></button>
+        <button className={`icon-button top-action viewer-toggle ${bot.viewerEnabled ? 'is-active' : ''}`} title={bot.viewerEnabled ? 'Disable 3D live preview' : 'Enable 3D live preview'} aria-label={bot.viewerEnabled ? 'Disable 3D live preview' : 'Enable 3D live preview'} aria-pressed={bot.viewerEnabled} onClick={() => void toggleViewer()} disabled={!bot.connected && !bot.viewerEnabled}><Eye size={16} /></button>
         <button className={`connect-button ${bot.connected ? 'is-connected' : ''} ${bot.connecting ? 'is-connecting' : ''}`} onClick={() => void toggleConnection()} disabled={!activeProfile || busy}>
           <i className={`status-dot ${bot.connected ? 'status-dot-live' : bot.connecting ? 'status-dot-wait' : ''}`} />
           <span>{bot.connected ? 'Disconnect' : bot.connecting ? 'Connecting' : 'Connect'}</span>
@@ -653,7 +677,7 @@ function App () {
     {bot.authCode && <div className="auth-banner"><span><Shield size={16} /> Microsoft sign-in required</span><strong>{bot.authCode.userCode}</strong><a href={bot.authCode.verificationUri} target="_blank" rel="noreferrer">Open sign-in <ArrowUpRight size={13} /></a></div>}
 
     <main className="main-content">
-      <div className="page-heading"><div><span className="eyebrow">{activeProfile.name.toUpperCase()} / {view === 'settings' ? 'CONFIGURATION' : view === 'bot-settings' ? 'BOT BEHAVIOR' : view === 'flat-surface' ? 'JOBS' : view === 'chat' ? 'COMMUNICATION' : 'TELEMETRY'}</span><h1>{activeView.label}</h1></div><div className="heading-meta"><span className={`connection-copy ${bot.connected ? 'is-live' : ''}`}><i className={`status-dot ${bot.connected ? 'status-dot-live' : bot.connecting ? 'status-dot-wait' : ''}`} />{bot.connected ? 'CONNECTED' : bot.connecting ? 'CONNECTING' : 'DISCONNECTED'}</span><span className="meta-separator" /> <span>PROFILE {String(activeProfile.id).padStart(2, '0')}</span></div></div>
+      <div className="page-heading"><div><span className="eyebrow">{activeProfile.name.toUpperCase()} / {view === 'settings' ? 'CONFIGURATION' : view === 'bot-settings' ? 'BOT BEHAVIOR' : view === 'flat-surface' ? 'JOBS' : view === 'viewer' ? 'WORLD PREVIEW' : view === 'chat' ? 'COMMUNICATION' : 'TELEMETRY'}</span><h1>{activeView.label}</h1></div><div className="heading-meta"><span className={`connection-copy ${bot.connected ? 'is-live' : ''}`}><i className={`status-dot ${bot.connected ? 'status-dot-live' : bot.connecting ? 'status-dot-wait' : ''}`} />{bot.connected ? 'CONNECTED' : bot.connecting ? 'CONNECTING' : 'DISCONNECTED'}</span><span className="meta-separator" /> <span>PROFILE {String(activeProfile.id).padStart(2, '0')}</span></div></div>
 
       {view === 'settings' && <section className="settings-layout">
         <div className="settings-main">
@@ -794,6 +818,14 @@ function App () {
         </div>
         <div className="information-foot"><span><CircleHelp size={13} /> Item data and equipment update from the live player inventory.</span><a href="https://github.com/Webisso/minecraft-item-icons" target="_blank" rel="noreferrer">ITEM ICON SOURCE <ArrowUpRight size={12} /></a></div>
       </section>}
+
+      {view === 'viewer' && <section className="viewer-page">
+        <div className="viewer-page-heading"><div><h2>3D world preview</h2><p>Live first-person world data from the connected bot.</p></div><div className="viewer-state"><i className={`status-dot ${bot.viewerRunning ? 'status-dot-live' : ''}`} />{bot.viewerRunning ? `LIVE / ${bot.viewerPort}` : 'OFFLINE'}</div></div>
+        {!bot.connected && <div className="viewer-placeholder"><Eye size={23} /><strong>Connect the bot to view the world</strong><span>The live preview becomes available after the bot spawns.</span></div>}
+        {bot.connected && !bot.viewerEnabled && <div className="viewer-placeholder"><Eye size={23} /><strong>Live preview is disabled</strong><span>Enable it with the eye toggle in the top bar.</span><button className="button button-primary" onClick={() => void toggleViewer()}><Eye size={15} /> Enable preview</button></div>}
+        {bot.connected && bot.viewerEnabled && !bot.viewerRunning && <div className="viewer-placeholder"><div className="loader-line" /><strong>Starting the 3D preview</strong><span>The viewer will appear here when its local server is ready.</span></div>}
+        {bot.connected && bot.viewerRunning && <iframe className="viewer-frame" src="/viewer/" title="ObsidianMC live Minecraft world preview" allow="fullscreen" />}
+      </section>}
     </main>
 
     <footer className="app-footer"><span><i className="status-dot" /> DATABASE / {databaseEngine}</span><span>PROFILE CHANGES {isDirty ? 'UNSAVED' : 'SAVED'}</span><span>MINEFLAYER 4.39.0</span></footer>
@@ -804,9 +836,9 @@ function App () {
 }
 
 function BrandLogo ({ compact = false }: { compact?: boolean }) {
-  return <div className={`brand-lockup ${compact ? 'brand-compact' : ''}`} role="img" aria-label="Obsidian plus Bot">
+  return <div className={`brand-lockup ${compact ? 'brand-compact' : ''}`} role="img" aria-label="ObsidianMC Bot">
     <span className="brand-glyph"><Gem size={17} strokeWidth={1.7} /><span className="brand-bot-mark"><Bot size={10} strokeWidth={1.8} /></span></span>
-    <span className="brand-wordmark"><strong>OBSIDIAN</strong><small>All In One Minecraft Automation Engine</small></span>
+    <span className="brand-wordmark"><strong>OBSIDIANMC</strong><small>All In One Minecraft Automation Engine</small></span>
   </div>
 }
 

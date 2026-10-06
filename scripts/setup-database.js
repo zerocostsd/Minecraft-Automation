@@ -95,15 +95,21 @@ function writeEnvironment (environment) {
   try {
     fs.writeFileSync(temporaryPath, contents, { encoding: 'utf8', mode: 0o600 })
     fs.renameSync(temporaryPath, envPath)
-    fs.chmodSync(envPath, 0o600)
-    const permissions = fs.statSync(envPath).mode & 0o777
-    if ((permissions & 0o077) !== 0) {
-      throw new Error('The filesystem did not preserve owner-only .env permissions. Secure the file manually before continuing.')
+    if (process.platform !== 'win32') {
+      fs.chmodSync(envPath, 0o600)
+      const permissions = fs.statSync(envPath).mode & 0o777
+      if ((permissions & 0o077) !== 0) {
+        throw new Error('The filesystem did not preserve owner-only .env permissions. Secure the file manually before continuing.')
+      }
     }
   } catch (error) {
     if (fs.existsSync(temporaryPath)) fs.unlinkSync(temporaryPath)
     throw error
   }
+}
+
+function printWindowsPermissionNote () {
+  process.stdout.write('Windows ACL permissions are not verified. To restrict .env access, run: icacls .env /inheritance:r /grant:r "%USERNAME%:F"\n')
 }
 
 async function main () {
@@ -112,9 +118,13 @@ async function main () {
 
   if (checkOnly) {
     if (!fs.existsSync(envPath)) throw new Error('No .env file exists. Run `npm run setup` first.')
-    const permissions = fs.statSync(envPath).mode & 0o777
-    if ((permissions & 0o077) !== 0) {
-      throw new Error('The .env file is readable by other users. Run `chmod 600 .env` before continuing.')
+    if (process.platform === 'win32') {
+      printWindowsPermissionNote()
+    } else {
+      const permissions = fs.statSync(envPath).mode & 0o777
+      if ((permissions & 0o077) !== 0) {
+        throw new Error('The .env file is readable by other users. Run `chmod 600 .env` before continuing.')
+      }
     }
     for (const [key, value] of Object.entries(environment)) {
       if (process.env[key] === undefined) process.env[key] = value
@@ -153,7 +163,12 @@ async function main () {
 
   writeEnvironment(environment)
   process.stdout.write(`Database connection verified and profile schema initialized (${databaseName}).\n`)
-  process.stdout.write(`Saved database settings to ${envPath} with owner-only permissions.\n`)
+  process.stdout.write(`Saved database settings to ${envPath}.\n`)
+  if (process.platform === 'win32') {
+    printWindowsPermissionNote()
+  } else {
+    process.stdout.write('Owner-only file permissions are set.\n')
+  }
 }
 
 main().catch(error => {

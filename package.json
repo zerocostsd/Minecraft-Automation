@@ -1,15 +1,15 @@
 {
-  "name": "obsidian-all-in-one-minecraft-automation-engine",
+  "name": "obsidianmc-all-in-one-minecraft-automation-engine",
   "version": "1.0.0",
   "private": true,
-  "description": "Obsidian All In One Minecraft Automation Engine",
+  "description": "ObsidianMC All In One Minecraft Automation Engine",
   "type": "commonjs",
   "scripts": {
     "dev": "concurrently -k \"npm:dev:api\" \"npm:dev:ui\"",
     "dev:api": "node --watch server/index.js",
     "dev:ui": "vite --host 0.0.0.0",
     "build": "tsc --noEmit && vite build",
-    "start": "node server/index.js",
+    "start": "npm run build && node scripts/start.js",
     "setup": "node scripts/setup-database.js",
     "setup:check": "node scripts/setup-database.js --check"
   },
@@ -19,6 +19,7 @@
   "dependencies": {
     "dotenv": "^16.6.1",
     "express": "^5.2.1",
+    "http-proxy": "1.18.1",
     "knex": "^3.3.0",
     "lucide-react": "^1.52.0",
     "mineflayer": "4.39.0",

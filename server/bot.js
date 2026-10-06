@@ -1,4 +1,5 @@
 const path = require('node:path')
+const net = require('node:net')
 const mineflayer = require('mineflayer')
 const { pathfinder, Movements } = require('mineflayer-pathfinder')
 const pvpPlugin = require('mineflayer-pvp').plugin
@@ -6,7 +7,9 @@ const { runFlatSurface } = require('./jobs/flat-surface')
 
 let bot = null
 let activeProfileId = null
-let viewerStarted = false
+let viewerEnabled = false
+let viewerBot = null
+let viewerClose = null
 let protectedTool = null
 let lastGreetingAt = 0
 let activeJobController = null
@@ -51,7 +54,10 @@ const state = {
   offhand: null,
   mainHand: null,
   botSettings: { ...botSettings },
-  activeJob: null
+  activeJob: null,
+  viewerEnabled: false,
+  viewerRunning: false,
+  viewerPort: Number(process.env.VIEWER_PORT || 3001)
 }
 
 function addLog (level, message) {
@@ -116,6 +122,79 @@ function refreshSnapshot () {
 function getState () {
   refreshSnapshot()
   return { ...state, inventory: [...state.inventory], armor: [...state.armor], chat: [...state.chat], logs: [...state.logs], botSettings: { ...state.botSettings }, activeJob: state.activeJob ? { ...state.activeJob } : null }
+}
+
+function getViewerStatus () {
+  return { enabled: viewerEnabled, running: state.viewerRunning, port: state.viewerPort }
+}
+
+function stopViewer () {
+  if (viewerClose) {
+    try {
+      viewerClose()
+    } catch (error) {
+      addLog('warn', `3D preview could not close cleanly: ${error.message}`)
+    }
+  }
+  viewerBot = null
+  viewerClose = null
+  state.viewerRunning = false
+}
+
+function checkViewerPort (port) {
+  return new Promise(resolve => {
+    const probe = net.createServer()
+    probe.once('error', () => resolve(false))
+    probe.listen(port, () => probe.close(() => resolve(true)))
+  })
+}
+
+async function startViewer (activeBot) {
+  if (!viewerEnabled || !activeBot || !state.connected) return getViewerStatus()
+  if (viewerBot === activeBot && state.viewerRunning) return getViewerStatus()
+
+  const port = Number(process.env.VIEWER_PORT || 3001)
+  if (!(await checkViewerPort(port))) throw new Error(`3D preview port ${port} is already in use.`)
+  if (bot !== activeBot || !viewerEnabled) return getViewerStatus()
+
+  const { mineflayer: createViewer } = require('prismarine-viewer')
+  createViewer(activeBot, {
+    port,
+    prefix: '/viewer',
+    viewDistance: Number(process.env.VIEWER_VIEW_DISTANCE || 2),
+    firstPerson: true
+  })
+
+  if (!activeBot.viewer?.close) throw new Error('Prismarine Viewer did not expose a close handle.')
+  viewerBot = activeBot
+  viewerClose = activeBot.viewer.close.bind(activeBot.viewer)
+  state.viewerPort = port
+  state.viewerRunning = true
+  addLog('info', `3D preview listening on port ${port} with view distance ${process.env.VIEWER_VIEW_DISTANCE || 2}.`)
+  return getViewerStatus()
+}
+
+async function setViewerEnabled (enabled) {
+  if (typeof enabled !== 'boolean') throw new Error('Viewer enabled must be true or false.')
+  if (enabled && (!bot || !state.connected)) throw new Error('Connect the bot before enabling the 3D preview.')
+
+  viewerEnabled = enabled
+  state.viewerEnabled = enabled
+  if (!enabled) {
+    stopViewer()
+    addLog('info', '3D preview disabled.')
+    return getViewerStatus()
+  }
+
+  try {
+    return await startViewer(bot)
+  } catch (error) {
+    viewerEnabled = false
+    state.viewerEnabled = false
+    stopViewer()
+    addLog('error', `3D preview could not start: ${error.message}`)
+    throw error
+  }
 }
 
 function stopActiveJob (reason = 'Bot disconnected.') {
@@ -344,6 +423,7 @@ function connect (profile) {
       username: profile.username,
       auth: profile.auth_mode,
       version: profile.minecraft_version || '1.21.5',
+      viewDistance: process.env.BOT_VIEW_DISTANCE || 'tiny',
       profilesFolder: path.join(process.cwd(), '.auth-cache', String(profile.id)),
       onMsaCode: data => {
         state.authCode = {
@@ -385,19 +465,11 @@ function connect (profile) {
     void syncAutoEat(activeBot)
     scanHostileMobs(activeBot)
 
-    if (!viewerStarted) {
-      try {
-        const { mineflayer: startViewer } = require('prismarine-viewer')
-        startViewer(activeBot, {
-          port: Number(process.env.VIEWER_PORT || 3001),
-          firstPerson: true
-        })
-        viewerStarted = true
-        addLog('info', `3D viewer listening on port ${process.env.VIEWER_PORT || 3001}.`)
-      } catch (error) {
-        addLog('error', `3D viewer could not start: ${error.message}`)
-      }
-    }
+    if (viewerEnabled) void startViewer(activeBot).catch(error => {
+      viewerEnabled = false
+      state.viewerEnabled = false
+      addLog('error', `3D preview could not start: ${error.message}`)
+    })
     refreshSnapshot()
   })
   activeBot.on('messagestr', (message, position) => {
@@ -426,6 +498,7 @@ function connect (profile) {
   activeBot.on('end', reason => {
     if (bot !== activeBot) return
     stopActiveJob('Bot disconnected.')
+    stopViewer()
     addLog('warn', `Disconnected${reason ? `: ${reason}` : '.'}`)
     bot = null
     activeProfileId = null
@@ -448,6 +521,7 @@ function connect (profile) {
 
 function disconnect (reason = 'Disconnected from dashboard.') {
   stopActiveJob(reason)
+  stopViewer()
   if (!bot) {
     state.connecting = false
     state.connected = false
@@ -519,4 +593,4 @@ function clearChat () {
   state.chat = []
 }
 
-module.exports = { getState, connect, disconnect, sendChat, inventoryAction, clearTransientData, clearChat, updateSettings, startFlatSurface, stopJob, get activeProfileId () { return activeProfileId } }
+module.exports = { getState, getViewerStatus, setViewerEnabled, connect, disconnect, sendChat, inventoryAction, clearTransientData, clearChat, updateSettings, startFlatSurface, stopJob, get activeProfileId () { return activeProfileId } }

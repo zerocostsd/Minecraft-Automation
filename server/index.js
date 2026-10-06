@@ -1,8 +1,10 @@
 require('dotenv').config()
 
 const fs = require('node:fs')
+const http = require('node:http')
 const path = require('node:path')
 const express = require('express')
+const httpProxy = require('http-proxy')
 const mineflayer = require('mineflayer')
 const { db, databaseName, client, ensureDatabase } = require('./database')
 const botService = require('./bot')
@@ -13,6 +15,12 @@ const root = path.join(__dirname, '..')
 const port = Number(process.env.NODE_ENV === 'production'
   ? process.env.DASHBOARD_PORT || 3000
   : process.env.API_PORT || 3002)
+const viewerPort = Number(process.env.VIEWER_PORT || 3001)
+const viewerProxy = httpProxy.createProxyServer({
+  target: `http://127.0.0.1:${viewerPort}`,
+  changeOrigin: true,
+  ws: true
+})
 
 app.disable('x-powered-by')
 app.use(express.json({ limit: '32kb' }))
@@ -300,6 +308,11 @@ app.post('/api/bot/chat/clear', (req, res) => {
 })
 
 app.get('/api/bot/state', (req, res) => res.json(botService.getState()))
+app.get('/api/viewer', (req, res) => res.json(botService.getViewerStatus()))
+app.post('/api/viewer', asyncRoute(async (req, res) => {
+  const status = await botService.setViewerEnabled(req.body.enabled)
+  res.json(status)
+}))
 
 app.post('/api/bot/connect', asyncRoute(async (req, res) => {
   await ensureDatabase()
@@ -330,6 +343,14 @@ app.post('/api/bot/inventory/action', asyncRoute(async (req, res) => {
   res.status(202).json({ updated: true })
 }))
 
+app.use('/viewer', (req, res) => {
+  if (!botService.getViewerStatus().running) {
+    return res.status(503).type('text/plain').send('3D preview is disabled.')
+  }
+  req.url = req.originalUrl
+  viewerProxy.web(req, res)
+})
+
 app.use('/api', (req, res) => res.status(404).json({ error: 'API route not found.' }))
 
 if (process.env.NODE_ENV === 'production') {
@@ -350,8 +371,30 @@ app.use((error, req, res, next) => {
   res.status(status).json({ error: status >= 500 ? 'The request could not be completed.' : error.message })
 })
 
-app.listen(port, process.env.DASHBOARD_HOST || '0.0.0.0', () => {
-  console.log(`Dashboard API listening on ${port} (${databaseName})`)
+viewerProxy.on('error', (error, req, res) => {
+  console.error('3D preview proxy failed:', error.message)
+  if (res && typeof res.writeHead === 'function') {
+    if (!res.headersSent) res.writeHead(502, { 'Content-Type': 'text/plain' })
+    res.end('3D preview is unavailable.')
+  } else if (res?.destroy) {
+    res.destroy(error)
+  }
+})
+
+const server = http.createServer(app)
+server.on('upgrade', (req, socket, head) => {
+  const pathname = req.url?.split('?')[0] || ''
+  if (!pathname.startsWith('/viewer/socket.io')) return
+  if (!botService.getViewerStatus().running) {
+    socket.destroy()
+    return
+  }
+  viewerProxy.ws(req, socket, head)
+})
+
+server.listen(port, process.env.DASHBOARD_HOST || '0.0.0.0', () => {
+  const serviceName = process.env.NODE_ENV === 'production' ? 'Dashboard and API' : 'Dashboard API'
+  console.log(`${serviceName} listening on ${port} (${databaseName})`)
   ensureDatabase().catch(error => {
     console.error(`Database is not available yet (${databaseName}):`, error.message)
   })
