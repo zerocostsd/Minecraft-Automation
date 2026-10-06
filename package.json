@@ -1,0 +1,40 @@
+{
+  "name": "obsidian-all-in-one-minecraft-automation-engine",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Obsidian All In One Minecraft Automation Engine",
+  "type": "commonjs",
+  "scripts": {
+    "dev": "concurrently -k \"npm:dev:api\" \"npm:dev:ui\"",
+    "dev:api": "node --watch server/index.js",
+    "dev:ui": "vite --host 0.0.0.0",
+    "build": "tsc --noEmit && vite build",
+    "start": "node server/index.js",
+    "setup": "node scripts/setup-database.js",
+    "setup:check": "node scripts/setup-database.js --check"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "dotenv": "^16.6.1",
+    "express": "^5.2.1",
+    "knex": "^3.3.0",
+    "lucide-react": "^1.52.0",
+    "mineflayer": "4.39.0",
+    "mysql2": "^3.24.5",
+    "pg": "^8.23.1",
+    "prismarine-viewer": "^1.33.0",
+    "react": "^19.3.0",
+    "react-dom": "^19.3.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.10.0",
+    "@types/react": "^19.2.0",
+    "@types/react-dom": "^19.2.0",
+    "@vitejs/plugin-react": "^5.0.0",
+    "concurrently": "^9.2.1",
+    "typescript": "^5.9.3",
+    "vite": "^8.3.3"
+  }
+}

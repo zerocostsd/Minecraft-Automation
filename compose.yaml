@@ -1,0 +1,41 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    profiles: [psql]
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${DB_NAME:-minecraft_automation}
+      POSTGRES_USER: ${DB_USER:-minecraft_bot}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?Set DB_PASSWORD in .env}
+    ports:
+      - "127.0.0.1:${DB_PORT:-5432}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-minecraft_bot} -d ${DB_NAME:-minecraft_automation}"]
+      interval: 5s
+      timeout: 3s
+      retries: 15
+
+  mysql:
+    image: mysql:8.4
+    profiles: [mysql]
+    restart: unless-stopped
+    environment:
+      MYSQL_DATABASE: ${DB_NAME:-minecraft_automation}
+      MYSQL_USER: ${DB_USER:-minecraft_bot}
+      MYSQL_PASSWORD: ${DB_PASSWORD:?Set DB_PASSWORD in .env}
+      MYSQL_ROOT_PASSWORD: ${DB_ROOT_PASSWORD:-local-root-only}
+    ports:
+      - "127.0.0.1:${MYSQL_PORT:-3306}:3306"
+    volumes:
+      - mysql-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-u${DB_USER:-minecraft_bot}", "-p${DB_PASSWORD}"]
+      interval: 5s
+      timeout: 3s
+      retries: 15
+
+volumes:
+  postgres-data:
+  mysql-data:
